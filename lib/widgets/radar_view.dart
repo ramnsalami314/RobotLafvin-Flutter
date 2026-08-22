@@ -58,7 +58,7 @@ class RadarView extends StatelessWidget {
                   pathPoints:
                       controller.processedMode
                           ? List<Offset>.from(
-                              controller.localRobotPath,
+                              controller.robotPath,
                             )
                           : const <Offset>[],
 

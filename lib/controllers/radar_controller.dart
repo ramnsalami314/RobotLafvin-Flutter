@@ -1,6 +1,5 @@
 import 'dart:async';
 import 'dart:math' as math;
-import '../services/port_discovery_service.dart';
 
 import 'package:flutter/material.dart';
 
@@ -13,10 +12,7 @@ enum RadarRenderMode {
 
 class RadarController extends ChangeNotifier {
   RadarController()
-    : serial = SerialService(
-        portName: 'COM3',
-        baudRate: 9600,
-      );
+      : serial = SerialService();
 
   final SerialService serial;
 
@@ -28,64 +24,51 @@ class RadarController extends ChangeNotifier {
   static const double minimumVisibleDistance = 40;
   static const double zoomStep = 20;
 
-  /*
-   * IMPORTANT:
-   *
-   * Arduino scans servo:
-   *
-   * 5, 7, 9 ... 175
-   *
-   * RadarAngle = 180 - servoAngle
-   *
-   * Therefore Flutter receives:
-   *
-   * 175, 173, 171 ... 5
-   *
-   * These are ODD angles.
-   */
+  // Arduino sends odd radar angles:
+  // 5, 7, 9 ... 175
   static const int minimumRadarAngle = 5;
   static const int maximumRadarAngle = 175;
   static const int angleStep = 2;
 
-  /*
-   * Process three complete sweeps.
-   */
+  // Processed map uses the latest 3 completed sweeps.
   static const int processedSweepTarget = 3;
 
   // ==========================================================
-  // FILTER CONFIG
-  // ==========================================================
-
-  static const double minimumNeighborTolerance = 8;
-
-  static const double neighborTolerancePercent = 0.12;
-
-  static const double majorJumpCm = 25;
-
-  static const double severeJumpCm = 45;
-
-  // ==========================================================
-  // CONNECTION
+  // SERIAL / CONNECTION
   // ==========================================================
 
   StreamSubscription<String>? _lineSubscription;
+
   Timer? _driveHeartbeatTimer;
   Timer? _odometryTimer;
 
   bool isConnected = false;
 
-  String connectionMessage = 'Connecting...';
+  String connectionMessage =
+      'Not connected';
+
+  List<String> availablePorts = [];
+
+  String? selectedPort;
+
+  // USB Arduino:
+  // 115200
+  //
+  // HC-05:
+  // 9600
+  int selectedBaud = 115200;
 
   // ==========================================================
-  // UART FORMAT
+  // UART MESSAGE FORMAT
   // ==========================================================
 
-  final RegExp _radarPattern = RegExp(
+  final RegExp _radarPattern =
+      RegExp(
     r'ServoAngle:\s*(\d+)\s*,\s*RadarAngle:\s*(\d+)\s*,\s*Distance:\s*(-?[\d.]+)',
   );
 
   // ==========================================================
-  // CURRENT RADAR VALUES
+  // CURRENT RADAR STATE
   // ==========================================================
 
   int currentServoAngle = 90;
@@ -93,7 +76,8 @@ class RadarController extends ChangeNotifier {
 
   double currentDistance = -1;
 
-  double visibleDistance = maxRadarDistance;
+  double visibleDistance =
+      maxRadarDistance;
 
   // ==========================================================
   // DISPLAY MODE
@@ -120,45 +104,32 @@ class RadarController extends ChangeNotifier {
 
   String activeDriveCommand = 'X';
 
-  String driveStatus = 'STOPPED';
+  String driveStatus =
+      'STOPPED';
 
   // ==========================================================
-  // RAW DATA
+  // RAW RADAR
   // ==========================================================
 
-  final Map<int, double> rawReadings = {};
+  final Map<int, double> rawReadings =
+      {};
 
   // ==========================================================
-  // PROCESSED DATA
+  // PROCESSED RADAR
   // ==========================================================
 
-  final Map<int, double> processedReadings = {};
+  final Map<int, double>
+      processedReadings = {};
 
-  /*
-   * Unknown sector:
-   *
-   * We simply do not have enough information to know
-   * what exists there.
-   */
+  // Unknown = not enough reliable information.
   final Set<int> unknownAngles = {};
 
-  /*
-   * Occluded sector:
-   *
-   * angle -> distance where blocked region starts.
-   *
-   * Example:
-   *
-   * 90° -> 52 cm
-   *
-   * means:
-   *
-   * visibility exists until about 52 cm,
-   * then the environment behind that object is hidden.
-   */
-  final Map<int, double> occludedAngles = {};
+  // angle -> distance where blocked area begins.
+  final Map<int, double>
+      occludedAngles = {};
 
-  Map<int, double> get displayedReadings {
+  Map<int, double>
+      get displayedReadings {
     if (processedMode) {
       return processedReadings;
     }
@@ -170,7 +141,8 @@ class RadarController extends ChangeNotifier {
   // SWEEP HISTORY
   // ==========================================================
 
-  final Map<int, double> _currentSweep = {};
+  final Map<int, double>
+      _currentSweep = {};
 
   final List<Map<int, double>>
       _completedSweeps = [];
@@ -197,17 +169,17 @@ class RadarController extends ChangeNotifier {
   }
 
   // ==========================================================
-  // ROBOT PATH / DEAD RECKONING
+  // ROBOT PATH ESTIMATION
   // ==========================================================
 
-  static const double forwardSpeedCmPerSecond =
-      18;
+  static const double
+      forwardSpeedCmPerSecond = 18;
 
-  static const double reverseSpeedCmPerSecond =
-      14;
+  static const double
+      reverseSpeedCmPerSecond = 14;
 
-  static const double turnDegreesPerSecond =
-      95;
+  static const double
+      turnDegreesPerSecond = 95;
 
   double _robotXcm = 0;
   double _robotYcm = 0;
@@ -222,162 +194,234 @@ class RadarController extends ChangeNotifier {
     Offset.zero,
   ];
 
-  List<Offset> get localRobotPath {
-    final List<Offset> result = [];
-
-    final double cosHeading =
-        math.cos(_robotHeadingRadians);
-
-    final double sinHeading =
-        math.sin(_robotHeadingRadians);
-
-    for (final point in _globalRobotPath) {
-      final double dx =
-          point.dx - _robotXcm;
-
-      final double dy =
-          point.dy - _robotYcm;
-
-      /*
-       * Convert world position into robot-local
-       * coordinates.
-       */
-      final double lateral =
-          dx * cosHeading -
-          dy * sinHeading;
-
-      final double forward =
-          dx * sinHeading +
-          dy * cosHeading;
-
-      result.add(
-        Offset(
-          lateral,
-          forward,
-        ),
+  List<Offset> get robotPath =>
+      List<Offset>.unmodifiable(
+        _globalRobotPath,
       );
+
+  // ==========================================================
+  // PORT DISCOVERY
+  // ==========================================================
+
+  void refreshPorts() {
+    availablePorts =
+        serial.getAvailablePorts();
+
+    if (availablePorts.isEmpty) {
+      selectedPort = null;
+
+      connectionMessage =
+          'No COM ports found';
+
+      notifyListeners();
+      return;
     }
 
-    return result;
+    // Keep selected port if Windows still reports it.
+    if (selectedPort != null &&
+        availablePorts.contains(
+          selectedPort,
+        )) {
+      connectionMessage =
+          '${availablePorts.length} COM port(s) found';
+
+      notifyListeners();
+      return;
+    }
+
+    // Otherwise select the first available port.
+    selectedPort =
+        availablePorts.first;
+
+    connectionMessage =
+        '${availablePorts.length} COM port(s) found';
+
+    notifyListeners();
+  }
+
+  void selectPort(
+    String? port,
+  ) {
+    if (isConnected) {
+      return;
+    }
+
+    selectedPort = port;
+
+    notifyListeners();
+  }
+
+  void selectBaud(
+    int baud,
+  ) {
+    if (isConnected) {
+      return;
+    }
+
+    selectedBaud = baud;
+
+    notifyListeners();
   }
 
   // ==========================================================
   // CONNECT
   // ==========================================================
 
- void connect() {
-  final DiscoveredPort? bluetooth =
-      PortDiscoveryService
-          .findLikelyBluetoothPort();
+  void connectSelectedPort() {
+    final String? port =
+        selectedPort;
 
-  if (bluetooth != null) {
-    serial.portName =
-        bluetooth.portName;
+    if (port == null) {
+      connectionMessage =
+          'Select a COM port first';
 
-    serial.baudRate = 9600;
+      notifyListeners();
+      return;
+    }
+
+    disconnect();
+
+    _lineSubscription =
+        serial.lines.listen(
+      _processLine,
+    );
+
+    final bool success =
+        serial.connect(
+      port: port,
+      baud: selectedBaud,
+    );
+
+    if (!success) {
+      isConnected = false;
+
+      connectionMessage =
+          'Failed to open '
+          '$port @ $selectedBaud';
+
+      notifyListeners();
+      return;
+    }
+
+    isConnected = true;
 
     connectionMessage =
-        'Bluetooth found: '
-        '${bluetooth.portName}';
-  } else {
-    /*
-     * USB fallback.
-     */
-    serial.portName = 'COM3';
+        'Connected: '
+        '$port @ $selectedBaud';
 
-    serial.baudRate = 115200;
+    // Safety first.
+    serial.sendLine(
+      'DRIVE:X',
+    );
 
-    connectionMessage =
-        'Bluetooth not found — trying USB COM3';
+    // Automatic scan is default.
+    serial.sendLine(
+      'RADAR:AUTO',
+    );
+
+    // --------------------------------------------------------
+    // Drive heartbeat
+    // --------------------------------------------------------
+
+    _driveHeartbeatTimer =
+        Timer.periodic(
+      const Duration(
+        milliseconds: 120,
+      ),
+      (_) {
+        if (activeDriveCommand !=
+            'X') {
+          serial.sendLine(
+            'DRIVE:$activeDriveCommand',
+          );
+        }
+      },
+    );
+
+    // --------------------------------------------------------
+    // Estimated path timer
+    // --------------------------------------------------------
+
+    _lastOdometryUpdate =
+        DateTime.now();
+
+    _odometryTimer =
+        Timer.periodic(
+      const Duration(
+        milliseconds: 50,
+      ),
+      (_) {
+        _updateOdometry();
+      },
+    );
+
+    notifyListeners();
   }
 
-  _lineSubscription =
-      serial.lines.listen(
-    _processLine,
-  );
+  // ==========================================================
+  // DISCONNECT
+  // ==========================================================
 
-  final bool success =
-      serial.connect();
+  void disconnect() {
+    if (isConnected) {
+      serial.sendLine(
+        'DRIVE:X',
+      );
+    }
 
-  if (!success) {
+    _driveHeartbeatTimer
+        ?.cancel();
+
+    _driveHeartbeatTimer =
+        null;
+
+    _odometryTimer
+        ?.cancel();
+
+    _odometryTimer =
+        null;
+
+    _lineSubscription
+        ?.cancel();
+
+    _lineSubscription =
+        null;
+
+    serial.disconnect();
+
     isConnected = false;
 
+    activeDriveCommand = 'X';
+
+    driveStatus = 'STOPPED';
+
     connectionMessage =
-        'Could not connect to '
-        '${serial.portName}';
-
-    notifyListeners();
-
-    return;
-  }
-
-  isConnected = true;
-
-  connectionMessage =
-      '${bluetooth != null ? 'Bluetooth' : 'USB'} '
-      '${serial.portName}';
-
-  serial.sendLine(
-    'DRIVE:X',
-  );
-
-  serial.sendLine(
-    'RADAR:AUTO',
-  );
-
-  _driveHeartbeatTimer =
-      Timer.periodic(
-    const Duration(
-      milliseconds: 120,
-    ),
-    (_) {
-      if (activeDriveCommand != 'X') {
-        serial.sendLine(
-          'DRIVE:$activeDriveCommand',
-        );
-      }
-    },
-  );
-
-  _lastOdometryUpdate =
-      DateTime.now();
-
-  _odometryTimer =
-      Timer.periodic(
-    const Duration(
-      milliseconds: 50,
-    ),
-    (_) => _updateOdometry(),
-  );
-
-  notifyListeners();
-}
-
-  // ==========================================================
-  // MODE
-  // ==========================================================
-
-  void setRenderMode(
-    RadarRenderMode mode,
-  ) {
-    renderMode = mode;
+        'Disconnected';
 
     notifyListeners();
   }
 
   // ==========================================================
-  // UART PARSING
+  // RECEIVE UART DATA
   // ==========================================================
 
   void _processLine(
     String line,
   ) {
+    debugPrint(
+      'ARDUINO >>> $line',
+    );
+
     final RegExpMatch? match =
         _radarPattern.firstMatch(
       line,
     );
 
     if (match == null) {
+      debugPrint(
+        'PARSE FAILED >>> $line',
+      );
+
       return;
     }
 
@@ -402,6 +446,13 @@ class RadarController extends ChangeNotifier {
       return;
     }
 
+    debugPrint(
+      'PARSED >>> '
+      'servo=$servoAngle '
+      'radar=$radarAngle '
+      'distance=$distance',
+    );
+
     if (radarAngle <
             minimumRadarAngle ||
         radarAngle >
@@ -419,14 +470,22 @@ class RadarController extends ChangeNotifier {
         distance;
 
     // --------------------------------------------------------
-    // Raw display
+    // RAW DATA
     // --------------------------------------------------------
 
     if (distance > 0 &&
-        distance <= maxRadarDistance) {
+        distance <=
+            maxRadarDistance) {
       rawReadings[
         radarAngle
       ] = distance;
+
+      debugPrint(
+        'RAW POINT >>> '
+        '$radarAngle° = '
+        '${distance.toStringAsFixed(1)} cm '
+        '| total=${rawReadings.length}',
+      );
     } else {
       rawReadings.remove(
         radarAngle,
@@ -434,7 +493,7 @@ class RadarController extends ChangeNotifier {
     }
 
     // --------------------------------------------------------
-    // Sweep recording
+    // RECORD SWEEP FOR PROCESSED MODE
     // --------------------------------------------------------
 
     _recordSweepPoint(
@@ -453,7 +512,8 @@ class RadarController extends ChangeNotifier {
     int angle,
     double distance,
   ) {
-    if (_previousRadarAngle != null) {
+    if (_previousRadarAngle !=
+        null) {
       final int delta =
           angle -
           _previousRadarAngle!;
@@ -464,10 +524,9 @@ class RadarController extends ChangeNotifier {
                 ? 1
                 : -1;
 
-        /*
-         * Direction reversal means one sweep ended.
-         */
-        if (_previousDirection != 0 &&
+        // Direction changed = one sweep ended.
+        if (_previousDirection !=
+                0 &&
             newDirection !=
                 _previousDirection) {
           _completeCurrentSweep();
@@ -479,7 +538,8 @@ class RadarController extends ChangeNotifier {
     }
 
     if (distance > 0 &&
-        distance <= maxRadarDistance) {
+        distance <=
+            maxRadarDistance) {
       _currentSweep[
         angle
       ] = distance;
@@ -508,15 +568,18 @@ class RadarController extends ChangeNotifier {
       ),
     );
 
-    /*
-     * Only retain most recent 3.
-     */
     while (_completedSweeps.length >
         processedSweepTarget) {
       _completedSweeps.removeAt(
         0,
       );
     }
+
+    debugPrint(
+      'SWEEP COMPLETE >>> '
+      '${_completedSweeps.length}/'
+      '$processedSweepTarget',
+    );
 
     _currentSweep.clear();
 
@@ -529,23 +592,24 @@ class RadarController extends ChangeNotifier {
 
   void _buildProcessedEnvironment() {
     processedReadings.clear();
+
     unknownAngles.clear();
+
     occludedAngles.clear();
 
     if (_completedSweeps.isEmpty) {
       return;
     }
 
-    final Map<int, double> consensusReadings =
-        {};
+    final Map<int, double>
+        consensusReadings = {};
 
-    final Map<int, int> confidence =
-        {};
+    final Map<int, int>
+        confidence = {};
 
     // ========================================================
     // PASS 1
-    //
-    // Compare same angle across multiple sweeps.
+    // Compare each angle over repeated sweeps.
     // ========================================================
 
     for (
@@ -565,19 +629,12 @@ class RadarController extends ChangeNotifier {
 
         if (value != null &&
             value > 0 &&
-            value <= maxRadarDistance) {
+            value <=
+                maxRadarDistance) {
           samples.add(
             value,
           );
         }
-      }
-
-      if (samples.isEmpty) {
-        unknownAngles.add(
-          angle,
-        );
-
-        continue;
       }
 
       final _ConsensusResult? result =
@@ -604,8 +661,7 @@ class RadarController extends ChangeNotifier {
 
     // ========================================================
     // PASS 2
-    //
-    // Spatial reasoning.
+    // Neighborhood validation.
     // ========================================================
 
     for (
@@ -620,12 +676,12 @@ class RadarController extends ChangeNotifier {
         angle
       ];
 
-      final double? left1 =
+      final double? left =
           consensusReadings[
         angle - 2
       ];
 
-      final double? right1 =
+      final double? right =
           consensusReadings[
         angle + 2
       ];
@@ -641,26 +697,23 @@ class RadarController extends ChangeNotifier {
       ];
 
       // ------------------------------------------------------
-      // Nothing detected
+      // No reading at this angle.
       // ------------------------------------------------------
 
       if (current == null) {
-        /*
-         * Tiny missing hole between two agreeing
-         * measurements.
-         */
-        if (left1 != null &&
-            right1 != null &&
+        // Fill tiny gaps only if neighbors agree strongly.
+        if (left != null &&
+            right != null &&
             _similar(
-              left1,
-              right1,
+              left,
+              right,
             )) {
           processedReadings[
             angle
           ] =
               (
-                left1 +
-                right1
+                left +
+                right
               ) /
               2.0;
 
@@ -682,22 +735,22 @@ class RadarController extends ChangeNotifier {
           ] ??
           0;
 
-      final bool leftSupported =
-          left1 != null &&
+      final bool leftSupport =
+          left != null &&
               _similar(
                 current,
-                left1,
+                left,
               );
 
-      final bool rightSupported =
-          right1 != null &&
+      final bool rightSupport =
+          right != null &&
               _similar(
                 current,
-                right1,
+                right,
               );
 
       // ------------------------------------------------------
-      // Very high confidence
+      // Strong repeated reading.
       // ------------------------------------------------------
 
       if (confidenceLevel >= 3) {
@@ -709,11 +762,11 @@ class RadarController extends ChangeNotifier {
       }
 
       // ------------------------------------------------------
-      // Both immediate neighbors agree
+      // Both sides agree.
       // ------------------------------------------------------
 
-      if (leftSupported &&
-          rightSupported) {
+      if (leftSupport &&
+          rightSupport) {
         processedReadings[
           angle
         ] = current;
@@ -722,100 +775,70 @@ class RadarController extends ChangeNotifier {
       }
 
       // ------------------------------------------------------
-      // One side supports the point
+      // Edge detection
       // ------------------------------------------------------
 
-      if (leftSupported &&
-          !rightSupported) {
-        /*
-         * Could be right edge of object.
-         */
-        if (right1 == null) {
-          processedReadings[
-            angle
-          ] = current;
-
-          continue;
-        }
-
-        if (_distanceJump(
-              current,
-              right1,
-            ) >
-            majorJumpCm) {
-          processedReadings[
-            angle
-          ] = current;
-
-          continue;
-        }
-      }
-
-      if (rightSupported &&
-          !leftSupported) {
-        /*
-         * Could be left edge of object.
-         */
-        if (left1 == null) {
-          processedReadings[
-            angle
-          ] = current;
-
-          continue;
-        }
-
-        if (_distanceJump(
-              current,
-              left1,
-            ) >
-            majorJumpCm) {
-          processedReadings[
-            angle
-          ] = current;
-
-          continue;
-        }
-      }
-
-      // ------------------------------------------------------
-      // Classic spike:
-      //
-      // left and right agree,
-      // middle wildly differs.
-      // ------------------------------------------------------
-
-      if (left1 != null &&
-          right1 != null &&
-          _similar(
-            left1,
-            right1,
+      if (leftSupport &&
+          (
+            right == null ||
+            (
+                  current -
+                  right
+                ).abs() >
+                25
           )) {
-        final double jumpLeft =
-            _distanceJump(
-          current,
-          left1,
-        );
+        processedReadings[
+          angle
+        ] = current;
 
-        final double jumpRight =
-            _distanceJump(
-          current,
-          right1,
-        );
+        continue;
+      }
 
-        if (jumpLeft >
-                majorJumpCm &&
-            jumpRight >
-                majorJumpCm) {
-          unknownAngles.add(
-            angle,
-          );
+      if (rightSupport &&
+          (
+            left == null ||
+            (
+                  current -
+                  left
+                ).abs() >
+                25
+          )) {
+        processedReadings[
+          angle
+        ] = current;
 
-          continue;
-        }
+        continue;
       }
 
       // ------------------------------------------------------
-      // Wider neighborhood agrees but current does not.
+      // Isolated spike
+      // ------------------------------------------------------
+
+      if (left != null &&
+          right != null &&
+          _similar(
+            left,
+            right,
+          ) &&
+          (
+                current -
+                left
+              ).abs() >
+              25 &&
+          (
+                current -
+                right
+              ).abs() >
+              25) {
+        unknownAngles.add(
+          angle,
+        );
+
+        continue;
+      }
+
+      // ------------------------------------------------------
+      // Wide neighborhood says current is wrong.
       // ------------------------------------------------------
 
       if (left2 != null &&
@@ -836,43 +859,11 @@ class RadarController extends ChangeNotifier {
       }
 
       // ------------------------------------------------------
-      // Severe isolated discontinuity.
+      // Weak isolated reading.
       // ------------------------------------------------------
 
-      if (left1 != null &&
-          right1 != null) {
-        final double jumpLeft =
-            _distanceJump(
-          current,
-          left1,
-        );
-
-        final double jumpRight =
-            _distanceJump(
-          current,
-          right1,
-        );
-
-        if (jumpLeft >
-                severeJumpCm &&
-            jumpRight >
-                severeJumpCm &&
-            confidenceLevel <
-                2) {
-          unknownAngles.add(
-            angle,
-          );
-
-          continue;
-        }
-      }
-
-      // ------------------------------------------------------
-      // Weak point with no support.
-      // ------------------------------------------------------
-
-      if (!leftSupported &&
-          !rightSupported &&
+      if (!leftSupport &&
+          !rightSupport &&
           confidenceLevel <
               2) {
         unknownAngles.add(
@@ -882,10 +873,6 @@ class RadarController extends ChangeNotifier {
         continue;
       }
 
-      // ------------------------------------------------------
-      // Otherwise keep it.
-      // ------------------------------------------------------
-
       processedReadings[
         angle
       ] = current;
@@ -893,8 +880,7 @@ class RadarController extends ChangeNotifier {
 
     // ========================================================
     // PASS 3
-    //
-    // Remove tiny isolated islands.
+    // Remove isolated islands.
     // ========================================================
 
     final Map<int, double> cleaned =
@@ -905,37 +891,25 @@ class RadarController extends ChangeNotifier {
       final int angle =
           entry.key;
 
-      final double distance =
-          entry.value;
-
-      final bool neighborLeft =
+      final bool supported =
           processedReadings
-              .containsKey(
-        angle - 2,
-      );
+                  .containsKey(
+                angle - 2,
+              ) ||
+              processedReadings
+                  .containsKey(
+                angle + 2,
+              ) ||
+              processedReadings
+                  .containsKey(
+                angle - 4,
+              ) ||
+              processedReadings
+                  .containsKey(
+                angle + 4,
+              );
 
-      final bool neighborRight =
-          processedReadings
-              .containsKey(
-        angle + 2,
-      );
-
-      final bool widerLeft =
-          processedReadings
-              .containsKey(
-        angle - 4,
-      );
-
-      final bool widerRight =
-          processedReadings
-              .containsKey(
-        angle + 4,
-      );
-
-      if (!neighborLeft &&
-          !neighborRight &&
-          !widerLeft &&
-          !widerRight) {
+      if (!supported) {
         unknownAngles.add(
           angle,
         );
@@ -945,7 +919,7 @@ class RadarController extends ChangeNotifier {
 
       cleaned[
         angle
-      ] = distance;
+      ] = entry.value;
     }
 
     processedReadings
@@ -956,10 +930,7 @@ class RadarController extends ChangeNotifier {
 
     // ========================================================
     // PASS 4
-    //
-    // Determine true occlusion.
-    //
-    // Nearby objects hide space behind them.
+    // Estimate blocked / occluded space.
     // ========================================================
 
     for (final entry
@@ -970,10 +941,6 @@ class RadarController extends ChangeNotifier {
       final double distance =
           entry.value;
 
-      /*
-       * A return near maximum range doesn't hide
-       * meaningful space behind it.
-       */
       if (distance >
           visibleDistance *
               0.85) {
@@ -1022,11 +989,6 @@ class RadarController extends ChangeNotifier {
           shadowAngle
         ];
 
-        /*
-         * If there is already a nearer or similarly
-         * placed measured object at this angle,
-         * don't classify the entire angle as hidden.
-         */
         if (visibleObject != null &&
             visibleObject <=
                 distance + 8) {
@@ -1048,41 +1010,39 @@ class RadarController extends ChangeNotifier {
       }
     }
 
-    // ========================================================
-    // PASS 5
-    //
-    // Unknown and occluded are different.
-    //
-    // Occlusion wins.
-    // ========================================================
-
+    // Occlusion is more specific than unknown.
     for (final int angle
         in occludedAngles.keys) {
       unknownAngles.remove(
         angle,
       );
     }
+
+    debugPrint(
+      'PROCESSED >>> '
+      '${processedReadings.length} surfaces | '
+      '${unknownAngles.length} unknown | '
+      '${occludedAngles.length} blocked',
+    );
   }
 
   // ==========================================================
-  // CONSENSUS
+  // MULTI-SWEEP CONSENSUS
   // ==========================================================
 
   _ConsensusResult? _findConsensus(
     List<double> input,
   ) {
     final List<double> values =
-        List<double>.from(input)
-          ..sort();
+        List<double>.from(
+      input,
+    )..sort();
 
     if (values.isEmpty) {
       return null;
     }
 
-    // --------------------------------------------------------
-    // Only one sweep contains this point
-    // --------------------------------------------------------
-
+    // One sweep only.
     if (values.length == 1) {
       return _ConsensusResult(
         distance:
@@ -1092,21 +1052,18 @@ class RadarController extends ChangeNotifier {
       );
     }
 
-    // --------------------------------------------------------
-    // Two samples
-    // --------------------------------------------------------
-
+    // Two sweeps.
     if (values.length == 2) {
-      final double a =
-          values[0];
-
-      final double b =
-          values[1];
-
-      if (_similar(a, b)) {
+      if (_similar(
+        values[0],
+        values[1],
+      )) {
         return _ConsensusResult(
           distance:
-              (a + b) /
+              (
+                values[0] +
+                values[1]
+              ) /
               2.0,
           confidence:
               2,
@@ -1116,10 +1073,7 @@ class RadarController extends ChangeNotifier {
       return null;
     }
 
-    // --------------------------------------------------------
-    // Three samples
-    // --------------------------------------------------------
-
+    // Three sweeps.
     final double a =
         values[0];
 
@@ -1147,8 +1101,7 @@ class RadarController extends ChangeNotifier {
       c,
     );
 
-    if (ab &&
-        bc) {
+    if (ab && bc) {
       return _ConsensusResult(
         distance:
             b,
@@ -1200,18 +1153,8 @@ class RadarController extends ChangeNotifier {
   }
 
   // ==========================================================
-  // FILTER HELPERS
+  // DISTANCE COMPARISON
   // ==========================================================
-
-  double _allowedDifference(
-    double distance,
-  ) {
-    return math.max(
-      minimumNeighborTolerance,
-      distance *
-          neighborTolerancePercent,
-    );
-  }
 
   bool _similar(
     double a,
@@ -1223,17 +1166,30 @@ class RadarController extends ChangeNotifier {
       b,
     );
 
-    return (a - b).abs() <=
-        _allowedDifference(
-          reference,
-        );
+    final double tolerance =
+        math.max(
+      8.0,
+      reference *
+          0.12,
+    );
+
+    return (
+          a -
+          b
+        ).abs() <=
+        tolerance;
   }
 
-  double _distanceJump(
-    double a,
-    double b,
+  // ==========================================================
+  // DISPLAY MODE
+  // ==========================================================
+
+  void setRenderMode(
+    RadarRenderMode mode,
   ) {
-    return (a - b).abs();
+    renderMode = mode;
+
+    notifyListeners();
   }
 
   // ==========================================================
@@ -1286,9 +1242,11 @@ class RadarController extends ChangeNotifier {
     driveStatus =
         'STOPPED';
 
-    serial.sendLine(
-      'DRIVE:X',
-    );
+    if (isConnected) {
+      serial.sendLine(
+        'DRIVE:X',
+      );
+    }
 
     notifyListeners();
   }
@@ -1326,6 +1284,10 @@ class RadarController extends ChangeNotifier {
 
     double movement = 0;
 
+    // --------------------------------------------------------
+    // Forward
+    // --------------------------------------------------------
+
     if (activeDriveCommand ==
         'W') {
       movement =
@@ -1344,6 +1306,10 @@ class RadarController extends ChangeNotifier {
           ) *
           movement;
     }
+
+    // --------------------------------------------------------
+    // Reverse
+    // --------------------------------------------------------
 
     else if (activeDriveCommand ==
         'S') {
@@ -1364,6 +1330,10 @@ class RadarController extends ChangeNotifier {
           movement;
     }
 
+    // --------------------------------------------------------
+    // Turn left
+    // --------------------------------------------------------
+
     else if (activeDriveCommand ==
         'A') {
       _robotHeadingRadians -=
@@ -1372,6 +1342,10 @@ class RadarController extends ChangeNotifier {
           math.pi /
           180.0;
     }
+
+    // --------------------------------------------------------
+    // Turn right
+    // --------------------------------------------------------
 
     else if (activeDriveCommand ==
         'D') {
@@ -1386,21 +1360,22 @@ class RadarController extends ChangeNotifier {
       totalPathCm +=
           movement;
 
-      final Offset point =
+      final Offset position =
           Offset(
         _robotXcm,
         _robotYcm,
       );
 
-      if ((point -
+      if ((position -
                   _globalRobotPath
                       .last)
               .distance >=
           2) {
         _globalRobotPath.add(
-          point,
+          position,
         );
 
+        // Prevent unbounded memory growth.
         if (_globalRobotPath.length >
             500) {
           _globalRobotPath.removeAt(
@@ -1420,6 +1395,10 @@ class RadarController extends ChangeNotifier {
   void setManualRadar(
     bool enabled,
   ) {
+    if (!isConnected) {
+      return;
+    }
+
     manualRadar =
         enabled;
 
@@ -1466,7 +1445,8 @@ class RadarController extends ChangeNotifier {
   }
 
   void sendManualServoAngle() {
-    if (!manualRadar) {
+    if (!manualRadar ||
+        !isConnected) {
       return;
     }
 
@@ -1511,7 +1491,7 @@ class RadarController extends ChangeNotifier {
   }
 
   // ==========================================================
-  // CLEAR
+  // CLEAR RADAR
   // ==========================================================
 
   void clearRadar() {
@@ -1542,18 +1522,7 @@ class RadarController extends ChangeNotifier {
 
   @override
   void dispose() {
-    serial.sendLine(
-      'DRIVE:X',
-    );
-
-    _driveHeartbeatTimer
-        ?.cancel();
-
-    _odometryTimer
-        ?.cancel();
-
-    _lineSubscription
-        ?.cancel();
+    disconnect();
 
     serial.dispose();
 

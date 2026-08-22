@@ -7,78 +7,94 @@ import 'package:flutter_libserialport/flutter_libserialport.dart';
 
 class SerialService {
   SerialService({
-    required this.portName,
-    this.baudRate = 9600,
+    this.portName,
+    this.baudRate = 115200,
   });
 
-  String portName;
+  String? portName;
   int baudRate;
 
   SerialPort? _port;
-
   Timer? _readTimer;
-
   String _buffer = '';
 
   final StreamController<String> _lineController =
       StreamController<String>.broadcast();
 
-  Stream<String> get lines =>
-      _lineController.stream;
+  Stream<String> get lines => _lineController.stream;
 
-  bool get isOpen =>
-      _port?.isOpen ?? false;
+  bool get isOpen => _port?.isOpen ?? false;
 
-  bool connect() {
+  List<String> getAvailablePorts() {
+    final List<String> ports =
+        List<String>.from(
+      SerialPort.availablePorts,
+    );
+
+    ports.sort();
+
+    return ports;
+  }
+
+  bool connect({
+    required String port,
+    required int baud,
+  }) {
     disconnect();
 
-    if (!SerialPort.availablePorts.contains(portName)) {
+    portName = port;
+    baudRate = baud;
+
+    if (!SerialPort.availablePorts.contains(port)) {
       debugPrint(
-        'Port not found: $portName',
+        'Port not available: $port',
       );
 
       return false;
     }
 
-    final SerialPort port =
-        SerialPort(portName);
+    final SerialPort serialPort =
+        SerialPort(port);
 
-    if (!port.openReadWrite()) {
+    if (!serialPort.openReadWrite()) {
       debugPrint(
-        'Could not open $portName: '
+        'Failed to open $port: '
         '${SerialPort.lastError}',
       );
 
-      port.dispose();
+      serialPort.dispose();
 
       return false;
     }
 
     final SerialPortConfig config =
         SerialPortConfig()
-          ..baudRate = baudRate
+          ..baudRate = baud
           ..bits = 8
-          ..parity = SerialPortParity.none
+          ..parity =
+              SerialPortParity.none
           ..stopBits = 1
           ..setFlowControl(
             SerialPortFlowControl.none,
           );
 
-    port.config = config;
+    serialPort.config = config;
 
     config.dispose();
 
-    _port = port;
+    _port = serialPort;
+    _buffer = '';
 
-    _readTimer = Timer.periodic(
+    _readTimer =
+        Timer.periodic(
       const Duration(
-        milliseconds: 10,
+        milliseconds: 8,
       ),
       (_) => _readAvailable(),
     );
 
     debugPrint(
-      'Connected to $portName @ $baudRate',
+      'Connected to $port @ $baud',
     );
 
     return true;
@@ -108,7 +124,7 @@ class SerialService {
       );
     } catch (error) {
       debugPrint(
-        'UART write error: $error',
+        'Serial write error: $error',
       );
     }
   }
@@ -148,21 +164,21 @@ class SerialService {
       _processBuffer();
     } catch (error) {
       debugPrint(
-        'UART read error: $error',
+        'Serial read error: $error',
       );
     }
   }
 
   void _processBuffer() {
     while (_buffer.contains('\n')) {
-      final int index =
+      final int newlineIndex =
           _buffer.indexOf('\n');
 
       final String line =
           _buffer
               .substring(
                 0,
-                index,
+                newlineIndex,
               )
               .replaceAll(
                 '\r',
@@ -172,20 +188,25 @@ class SerialService {
 
       _buffer =
           _buffer.substring(
-        index + 1,
+        newlineIndex + 1,
       );
 
-      if (line.isNotEmpty) {
-        _lineController.add(
-          line,
-        );
+      if (line.isEmpty) {
+        continue;
       }
+
+      debugPrint(
+        'SERIAL >>> $line',
+      );
+
+      _lineController.add(
+        line,
+      );
     }
   }
 
   void disconnect() {
     _readTimer?.cancel();
-
     _readTimer = null;
 
     final SerialPort? port =
